@@ -18,4 +18,6 @@ torch
 torchvision
 transformers
 tyro
+wandb
+websockets>=14.1
 zmq

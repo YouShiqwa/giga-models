@@ -1,3 +1,4 @@
+import copy
 from typing import List, Optional, Tuple
 
 import torch
@@ -212,31 +213,58 @@ class GemmaAttentionWithExpert(nn.Module):
         # RoPE params
         rope_max_wavelength: int = 10_000,
         rope_max_seq_len: int = 8192,
+        dual_action_expert: bool = False,
     ):
         super().__init__()
         self.layer_idx = layer_idx
+        self.num_action_experts = 2 if dual_action_expert else 1
+
+        action_q_proj = nn.Linear(
+            expert_hidden_size,
+            expert_num_attention_heads * expert_head_dim,
+            bias=expert_attention_bias,
+        )
+        action_k_proj = nn.Linear(
+            expert_hidden_size,
+            expert_num_key_value_heads * expert_head_dim,
+            bias=expert_attention_bias,
+        )
+        action_v_proj = nn.Linear(
+            expert_hidden_size,
+            expert_num_key_value_heads * expert_head_dim,
+            bias=expert_attention_bias,
+        )
+        action_o_proj = nn.Linear(
+            expert_num_attention_heads * expert_head_dim,
+            expert_hidden_size,
+            bias=expert_attention_bias,
+        )
         self.q_proj = nn.ModuleList(
             [
                 nn.Linear(paligemma_hidden_size, paligemma_num_attention_heads * paligemma_head_dim, bias=paligemma_attention_bias),
-                nn.Linear(expert_hidden_size, expert_num_attention_heads * expert_head_dim, bias=expert_attention_bias),
+                action_q_proj,
+                *([copy.deepcopy(action_q_proj)] if dual_action_expert else []),
             ]
         )
         self.k_proj = nn.ModuleList(
             [
                 nn.Linear(paligemma_hidden_size, paligemma_num_key_value_heads * paligemma_head_dim, bias=paligemma_attention_bias),
-                nn.Linear(expert_hidden_size, expert_num_key_value_heads * expert_head_dim, bias=expert_attention_bias),
+                action_k_proj,
+                *([copy.deepcopy(action_k_proj)] if dual_action_expert else []),
             ]
         )
         self.v_proj = nn.ModuleList(
             [
                 nn.Linear(paligemma_hidden_size, paligemma_num_key_value_heads * paligemma_head_dim, bias=paligemma_attention_bias),
-                nn.Linear(expert_hidden_size, expert_num_key_value_heads * expert_head_dim, bias=expert_attention_bias),
+                action_v_proj,
+                *([copy.deepcopy(action_v_proj)] if dual_action_expert else []),
             ]
         )
         self.o_proj = nn.ModuleList(
             [
                 nn.Linear(paligemma_num_attention_heads * paligemma_head_dim, paligemma_hidden_size, bias=paligemma_attention_bias),
-                nn.Linear(expert_num_attention_heads * expert_head_dim, expert_hidden_size, bias=expert_attention_bias),
+                action_o_proj,
+                *([copy.deepcopy(action_o_proj)] if dual_action_expert else []),
             ]
         )
 
@@ -252,6 +280,13 @@ class GemmaAttentionWithExpert(nn.Module):
         assert paligemma_num_key_value_heads == expert_num_key_value_heads
         self.rope_embedding = RoPEEmbedding(dim=paligemma_head_dim, max_wavelength=rope_max_wavelength, max_seq_len=rope_max_seq_len)
 
+    def initialize_mobility_expert_from_manipulation(self) -> None:
+        """Copy the original action attention weights into the mobility branch."""
+        if self.num_action_experts != 2:
+            raise RuntimeError('Mobility initialization requires dual_action_expert=True.')
+        for projections in (self.q_proj, self.k_proj, self.v_proj, self.o_proj):
+            projections[2] = copy.deepcopy(projections[1])
+
     def forward(
         self,
         inputs_embeds: List[Optional[torch.Tensor]],
@@ -261,10 +296,10 @@ class GemmaAttentionWithExpert(nn.Module):
         past_key_values: Optional[dict] = None,
         fill_kv_cache: bool = False,
     ) -> List[Optional[torch.Tensor]]:
-        """Multi-source attention over PaliGemma and Expert streams.
+        """Joint attention over PaliGemma and one or two action streams.
 
         Args:
-            inputs_embeds: [paligemma_embeds, expert_embeds]. Each is (B, L, D) or None.
+            inputs_embeds: ``[paligemma, manipulation, mobility?]`` streams.
             position_ids: (B, L) rotary positions.
             attention_mask: (B, L, L) attention mask.
             use_cache: Whether to use KV cache.
@@ -278,23 +313,21 @@ class GemmaAttentionWithExpert(nn.Module):
         key_states = []
         value_states = []
 
-        if inputs_embeds[0] is not None:
-            # PaliGemma
-            hidden_states = inputs_embeds[0]
-            input_shape = hidden_states.shape[:-1]
-            hidden_shape = (*input_shape, -1, self.paligemma_head_dim)
-            query_states.append(self.q_proj[0](hidden_states).view(hidden_shape))
-            key_states.append(self.k_proj[0](hidden_states).view(hidden_shape))
-            value_states.append(self.v_proj[0](hidden_states).view(hidden_shape))
+        if len(inputs_embeds) != len(self.q_proj):
+            raise ValueError(f'Expected {len(self.q_proj)} input streams, but got {len(inputs_embeds)}.')
 
-        if inputs_embeds[1] is not None:
-            # Expert
-            hidden_states = inputs_embeds[1]
+        for stream_idx, hidden_states in enumerate(inputs_embeds):
+            if hidden_states is None:
+                continue
             input_shape = hidden_states.shape[:-1]
-            hidden_shape = (*input_shape, -1, self.expert_head_dim)
-            query_states.append(self.q_proj[1](hidden_states).view(hidden_shape))
-            key_states.append(self.k_proj[1](hidden_states).view(hidden_shape))
-            value_states.append(self.v_proj[1](hidden_states).view(hidden_shape))
+            head_dim = self.paligemma_head_dim if stream_idx == 0 else self.expert_head_dim
+            hidden_shape = (*input_shape, -1, head_dim)
+            query_states.append(self.q_proj[stream_idx](hidden_states).view(hidden_shape))
+            key_states.append(self.k_proj[stream_idx](hidden_states).view(hidden_shape))
+            value_states.append(self.v_proj[stream_idx](hidden_states).view(hidden_shape))
+
+        if not query_states:
+            raise ValueError('At least one attention input stream must be present.')
 
         query_states = torch.cat(query_states, dim=1)
         key_states = torch.cat(key_states, dim=1)
@@ -336,32 +369,19 @@ class GemmaAttentionWithExpert(nn.Module):
         att_output = att_output.permute(0, 2, 1, 3)
         att_output = att_output.reshape(batch_size, -1, num_att_heads * head_dim)
 
-        outputs_embeds = []
+        outputs_embeds: list[Optional[torch.Tensor]] = []
         start = 0
-        if inputs_embeds[0] is not None:
-            hidden_states = inputs_embeds[0]
+        for stream_idx, hidden_states in enumerate(inputs_embeds):
+            if hidden_states is None:
+                outputs_embeds.append(None)
+                continue
             end = start + hidden_states.shape[1]
-            if att_output.dtype != self.o_proj[0].weight.dtype:
-                att_output_i = att_output[:, start:end].to(self.o_proj[0].weight.dtype)
+            if att_output.dtype != self.o_proj[stream_idx].weight.dtype:
+                att_output_i = att_output[:, start:end].to(self.o_proj[stream_idx].weight.dtype)
             else:
                 att_output_i = att_output[:, start:end]
-            out_emb = self.o_proj[0](att_output_i)
-            outputs_embeds.append(out_emb)
+            outputs_embeds.append(self.o_proj[stream_idx](att_output_i))
             start = end
-        else:
-            outputs_embeds.append(None)
-
-        if inputs_embeds[1] is not None:
-            hidden_states = inputs_embeds[1]
-            end = start + hidden_states.shape[1]
-            if att_output.dtype != self.o_proj[1].weight.dtype:
-                att_output_i = att_output[:, start:end].to(self.o_proj[1].weight.dtype)
-            else:
-                att_output_i = att_output[:, start:end]
-            out_emb = self.o_proj[1](att_output_i)
-            outputs_embeds.append(out_emb)
-        else:
-            outputs_embeds.append(None)
 
         return outputs_embeds
 
@@ -408,8 +428,10 @@ class GemmaDecoderLayerWithExpert(nn.Module):
         # RoPE params
         rope_max_wavelength: int = 10_000,
         rope_max_seq_len: int = 8192,
+        dual_action_expert: bool = False,
     ):
         super().__init__()
+        self.num_action_experts = 2 if dual_action_expert else 1
         self.self_attn = GemmaAttentionWithExpert(
             layer_idx,
             paligemma_hidden_size,
@@ -424,29 +446,49 @@ class GemmaDecoderLayerWithExpert(nn.Module):
             expert_attention_bias,
             rope_max_wavelength,
             rope_max_seq_len,
+            dual_action_expert,
         )
 
+        action_mlp = GemmaMLP(expert_hidden_size, expert_intermediate_size, expert_hidden_act)
         self.mlps = nn.ModuleList(
             [
                 GemmaMLP(paligemma_hidden_size, paligemma_intermediate_size, paligemma_hidden_act),
-                GemmaMLP(expert_hidden_size, expert_intermediate_size, expert_hidden_act),
+                action_mlp,
+                *([copy.deepcopy(action_mlp)] if dual_action_expert else []),
             ]
         )
 
+        action_input_layernorm = GemmaRMSNorm(expert_hidden_size, eps=expert_rms_norm_eps, use_ada_rms_norm=pi05_enabled)
         self.input_layernorms = nn.ModuleList(
             [
                 GemmaRMSNorm(paligemma_hidden_size, eps=paligemma_rms_norm_eps),
-                GemmaRMSNorm(expert_hidden_size, eps=expert_rms_norm_eps, use_ada_rms_norm=pi05_enabled),
+                action_input_layernorm,
+                *([copy.deepcopy(action_input_layernorm)] if dual_action_expert else []),
             ]
+        )
+        action_post_attention_layernorm = GemmaRMSNorm(
+            expert_hidden_size,
+            eps=expert_rms_norm_eps,
+            use_ada_rms_norm=pi05_enabled,
         )
         self.post_attention_layernorms = nn.ModuleList(
             [
                 GemmaRMSNorm(paligemma_hidden_size, eps=paligemma_rms_norm_eps),
-                GemmaRMSNorm(expert_hidden_size, eps=expert_rms_norm_eps, use_ada_rms_norm=pi05_enabled),
+                action_post_attention_layernorm,
+                *([copy.deepcopy(action_post_attention_layernorm)] if dual_action_expert else []),
             ]
         )
 
         self.pi05_enabled = pi05_enabled
+
+    def initialize_mobility_expert_from_manipulation(self) -> None:
+        """Copy all per-layer manipulation parameters into the mobility expert."""
+        if self.num_action_experts != 2:
+            raise RuntimeError('Mobility initialization requires dual_action_expert=True.')
+        self.self_attn.initialize_mobility_expert_from_manipulation()
+        self.mlps[2] = copy.deepcopy(self.mlps[1])
+        self.input_layernorms[2] = copy.deepcopy(self.input_layernorms[1])
+        self.post_attention_layernorms[2] = copy.deepcopy(self.post_attention_layernorms[1])
 
     def gated_residual(self, x, y, gate):
         if x is None or y is None:
@@ -465,11 +507,10 @@ class GemmaDecoderLayerWithExpert(nn.Module):
         past_key_values: Optional[dict] = None,
         fill_kv_cache: bool = False,
     ) -> List[Optional[torch.Tensor]]:
-        """Decoder layer with dual-stream attention and optional AdaRMS
-        modulation.
+        """Decoder layer with joint multi-stream attention and optional AdaRMS.
 
         Args:
-            inputs_embeds: [paligemma, expert] embeds.
+            inputs_embeds: ``[paligemma, manipulation, mobility?]`` embeds.
             adarms_cond: Optional conditioning vectors for AdaRMS.
             position_ids: (B, L) positions for RoPE.
             attention_mask: (B, L, L) attention mask.
@@ -528,6 +569,7 @@ class PaliGemmaWithExpertModel(nn.Module):
     def __init__(
         self,
         pi05_enabled: bool = False,
+        dual_action_expert: bool = False,
         # Paligemma params
         paligemma_vocab_size: int = 257152,
         paligemma_pad_token_id: int = 0,
@@ -554,6 +596,8 @@ class PaliGemmaWithExpertModel(nn.Module):
     ):
         super().__init__()
         self.pi05_enabled = pi05_enabled
+        self.dual_action_expert = dual_action_expert
+        self.num_action_experts = 2 if dual_action_expert else 1
 
         siglip_vision_config = get_transformers_siglip_vision_config()
 
@@ -591,18 +635,29 @@ class PaliGemmaWithExpertModel(nn.Module):
                     expert_rms_norm_eps=expert_rms_norm_eps,
                     rope_max_wavelength=rope_max_wavelength,
                     rope_max_seq_len=rope_max_seq_len,
+                    dual_action_expert=dual_action_expert,
                 )
                 for i in range(paligemma_num_hidden_layers)
             ]
         )
 
         # Final norms
+        action_norm = GemmaRMSNorm(expert_hidden_size, eps=expert_rms_norm_eps, use_ada_rms_norm=pi05_enabled)
         self.norms = nn.ModuleList(
             [
                 GemmaRMSNorm(paligemma_hidden_size, eps=1e-6),
-                GemmaRMSNorm(expert_hidden_size, eps=expert_rms_norm_eps, use_ada_rms_norm=pi05_enabled),
+                action_norm,
+                *([copy.deepcopy(action_norm)] if dual_action_expert else []),
             ]
         )
+
+    def initialize_mobility_expert_from_manipulation(self) -> None:
+        """Copy the complete pretrained manipulation tower into mobility."""
+        if not self.dual_action_expert:
+            raise RuntimeError('Mobility initialization requires dual_action_expert=True.')
+        for layer in self.layers:
+            layer.initialize_mobility_expert_from_manipulation()
+        self.norms[2] = copy.deepcopy(self.norms[1])
 
     def embed_image(self, image: torch.Tensor) -> torch.Tensor:
         """Encode images with SigLIP and project to hidden size."""
@@ -625,14 +680,13 @@ class PaliGemmaWithExpertModel(nn.Module):
         fill_kv_cache: Optional[bool] = None,
         adarms_cond: List[torch.FloatTensor] = None,
     ) -> Tuple[List[Optional[torch.Tensor]], dict]:
-        """Run the stacked dual-stream decoder with optional caching and
-        AdaRMS.
+        """Run the stacked joint-stream decoder with optional caching and AdaRMS.
 
         Args:
             attention_mask: (B, L, L) attention mask for both streams.
             position_ids: (B, L) RoPE positions.
             past_key_values: Optional KV cache dict to reuse.
-            inputs_embeds: [paligemma_embeds, expert_embeds].
+            inputs_embeds: ``[paligemma, manipulation, mobility?]``.
             use_cache: Whether to use KV cache.
             fill_kv_cache: If True, populate cache from inputs.
             adarms_cond: Optional per-stream modulation vectors for AdaRMS.

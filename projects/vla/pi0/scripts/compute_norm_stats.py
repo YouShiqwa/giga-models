@@ -1,8 +1,9 @@
+import dataclasses
+import json
 import pathlib
+from typing import Literal
 
 import numpy as np
-import numpydantic
-import pydantic
 import tyro
 from giga_datasets import load_dataset
 from torch.utils.data import DataLoader
@@ -10,14 +11,15 @@ from torch.utils.data.dataset import Dataset
 from tqdm import tqdm
 
 from giga_models.pipelines.vla.pi0.pi0_utils import AlohaInputs, DeltaActions, PadStatesAndActions
+from giga_models.pipelines.vla.pi0.robocasa_pi05_utils import reorder_robocasa_action, reorder_robocasa_state
 
 
-@pydantic.dataclasses.dataclass
+@dataclasses.dataclass
 class NormStats:
-    mean: numpydantic.NDArray
-    std: numpydantic.NDArray
-    q01: numpydantic.NDArray | None = None  # 1st quantile
-    q99: numpydantic.NDArray | None = None  # 99th quantile
+    mean: np.ndarray
+    std: np.ndarray
+    q01: np.ndarray | None = None  # 1st quantile
+    q99: np.ndarray | None = None  # 99th quantile
 
 
 class RunningStats:
@@ -119,10 +121,6 @@ class RunningStats:
         return results
 
 
-class _NormStatsDict(pydantic.BaseModel):
-    norm_stats: dict[str, NormStats]
-
-
 class TransformDataset(Dataset):
     def __init__(self, dataset, data_transforms, return_keys):
         self.dataset = dataset
@@ -144,13 +142,57 @@ class TransformDataset(Dataset):
         return result
 
 
+class RoboCasaStatsInputs:
+    """Reorder Groot state/action without requiring or decoding camera inputs."""
+
+    def __call__(self, data):
+        output = dict(data)
+        output['observation.state'] = reorder_robocasa_state(output['observation.state'])
+        output['action'] = reorder_robocasa_action(output['action'])
+        return output
+
+
 def serialize_json(norm_stats: dict[str, NormStats]) -> str:
     """Serialize the running statistics to a JSON string."""
-    return _NormStatsDict(norm_stats=norm_stats).model_dump_json(indent=2)
+    serializable = {
+        key: {
+            field.name: value.tolist()
+            for field in dataclasses.fields(stats)
+            if (value := getattr(stats, field.name)) is not None
+        }
+        for key, stats in norm_stats.items()
+    }
+    return json.dumps({'norm_stats': serializable}, indent=2)
+
+
+def pad_norm_stats(stats: NormStats, target_dim: int) -> NormStats:
+    """Pad canonical statistics using neutral normalization values."""
+    current_dim = stats.mean.shape[-1]
+    if current_dim > target_dim:
+        raise ValueError(f'Stats dimension {current_dim} exceeds target dimension {target_dim}.')
+    padding = target_dim - current_dim
+    if padding == 0:
+        return stats
+
+    q01 = None if stats.q01 is None else np.pad(stats.q01, (0, padding), constant_values=-1.0)
+    q99 = None if stats.q99 is None else np.pad(stats.q99, (0, padding), constant_values=1.0)
+    return NormStats(
+        mean=np.pad(stats.mean, (0, padding), constant_values=0.0),
+        std=np.pad(stats.std, (0, padding), constant_values=1.0),
+        q01=q01,
+        q99=q99,
+    )
 
 
 def compute_norm_stats(
-    data_paths: list[str], output_path: str, sample_rate: float = 1.0, action_chunk: int = 50, action_dim: int = 32, adapt_to_pi: bool = True
+    data_paths: list[str],
+    output_path: str,
+    sample_rate: float = 1.0,
+    action_chunk: int = 50,
+    action_dim: int = 32,
+    adapt_to_pi: bool = True,
+    dataset_type: Literal['aloha', 'robocasa'] = 'aloha',
+    num_workers: int = 64,
 ):
     """Compute normalization statistics from multiple datasets.
 
@@ -161,17 +203,28 @@ def compute_norm_stats(
         action_chunk: Number of action chunks for delta computation.
         action_dim: Dimension of the action space.
         adapt_to_pi: Whether to adapt the data to PI format.
+        dataset_type: Input schema. ``robocasa`` applies Groot-to-OpenPI state
+            and action reordering without ALOHA or delta-action transforms.
+        num_workers: Number of DataLoader workers.
     """
+    if not 0.0 < sample_rate <= 1.0:
+        raise ValueError(f'sample_rate must be in (0, 1], but got {sample_rate}.')
+    if num_workers < 0:
+        raise ValueError(f'num_workers must be non-negative, but got {num_workers}.')
+
     output_path = pathlib.Path(output_path)
 
     keys = ['observation.state', 'action']
     stats = {key: RunningStats() for key in keys}
 
-    data_transforms = [
-        AlohaInputs(adapt_to_pi=adapt_to_pi),
-        DeltaActions(),
-        PadStatesAndActions(action_dim=action_dim),
-    ]
+    if dataset_type == 'robocasa':
+        data_transforms = [RoboCasaStatsInputs()]
+    else:
+        data_transforms = [
+            AlohaInputs(adapt_to_pi=adapt_to_pi),
+            DeltaActions(),
+            PadStatesAndActions(action_dim=action_dim),
+        ]
 
     # Process each dataset path
     data_or_config = [
@@ -182,12 +235,15 @@ def compute_norm_stats(
                 action=action_chunk,
             ),
             meta_name='meta',
+            skip_video_decoding=True,
         )
         for data_path in data_paths
     ]
     dataset = load_dataset(data_or_config)
 
     num_frames = int(sample_rate * len(dataset))
+    if num_frames < 2:
+        raise ValueError(f'sample_rate selects only {num_frames} frames; at least 2 are required.')
     shuffle = False
     if sample_rate < 1.0:
         shuffle = True
@@ -197,9 +253,9 @@ def compute_norm_stats(
         transform_dataset,
         batch_size=1,
         shuffle=shuffle,
-        num_workers=64,
+        num_workers=num_workers,
         pin_memory=False,
-        persistent_workers=True,
+        persistent_workers=num_workers > 0,
     )
 
     # Update statistics from all datasets
@@ -211,8 +267,10 @@ def compute_norm_stats(
 
     # Compute final statistics from all datasets
     norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
+    if dataset_type == 'robocasa':
+        norm_stats = {key: pad_norm_stats(value, action_dim) for key, value in norm_stats.items()}
 
-    print(f'Writing stats to: {output_path}')
+    print(f'Writing {dataset_type} stats to: {output_path}')
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(serialize_json(norm_stats))
 

@@ -83,6 +83,14 @@ python scripts/compute_norm_stats.py \
 
 Then point your training config to the produced `norm_stats.json` (see examples in `configs`).
 
+For the local RoboCasa `SetUpCuttingStation` dataset, use the dedicated command. It skips video decoding, reorders Groot state/action fields to OpenPI layout, and pads the resulting statistics to 32 dimensions:
+
+```bash
+bash scripts/compute_robocasa_norm_stats.sh
+```
+
+The RoboCasa training config automatically uses the generated `meta/giga_pi05_robocasa_norm_stats.json`; before it exists, the config remains compatible with the dataset's raw `meta/stats.json`.
+
 ### 2. Download official OpenPI checkpoints and convert to PyTorch
 
 Use OpenPI's downloader to fetch JAX checkpoints, then convert using our script.
@@ -133,6 +141,38 @@ Pi0.5 training (FSDP2):
 
 ```bash
 python scripts/train.py --config configs.pi05.config
+```
+
+#### RoboCasa pi0.5 single-task fine-tuning
+
+The RoboCasa configs are wired to the local `SetUpCuttingStation` LeRobot v2.1 dataset. They follow the OpenPI RoboCasa layout: three cameras, 16-D state, 12-D action, 50-step chunks, mean/std normalization, and the same training parameters. They also use a native PyAV decoder because recent torchvision releases no longer provide `VideoReader`.
+
+Use the original single-action-expert config with:
+
+```bash
+python scripts/train.py --config configs.pi05_robocasa_set_up_cutting_station.config
+```
+
+The separate dual route enables an ABot-inspired dual action expert while retaining the pi0.5 expert architecture. The manipulation tower predicts action channels `0:7` and the mobility tower predicts channels `7:12`. Both towers keep pi0.5's 32-D input/output projection shape for checkpoint compatibility, but channels `12:32` are masked before the towers, receive no diffusion noise, produce zero output, and are excluded from loss. The two branch losses are averaged over their own channels, weighted equally, and logged separately.
+
+When the configured single-expert pi0.5 checkpoint is loaded, the complete pretrained expert (attention, FFN, AdaRMSNorm, final norm, and action projections) is copied into the second tower with independent parameter storage. A checkpoint saved after this conversion records `dual_action_expert=true` and reloads both trained towers directly.
+
+```bash
+python scripts/train.py --config configs.pi05_robocasa_set_up_cutting_station_dual.config
+```
+
+`RoboCasaPi05Pipeline` accepts OpenPI (`observation/image`, `observation/wrist_image`, `observation/right_image`), local LeRobot, or canonical GigaModels camera keys. Images may be uint8 HWC or float CHW. By default, deployment state uses OpenPI order:
+
+```text
+[eef_position_relative(3), eef_rotation_relative_quat(4),
+ base_position(3), base_rotation_quat(4), gripper_qpos(2)]
+```
+
+For a raw sample from this local LeRobot dataset, initialize the pipeline with `state_input_order='dataset'`. Predicted actions are returned in OpenPI RoboCasa order:
+
+```text
+[eef_position(3), eef_rotation(3), gripper_close(1),
+ base_motion(4), control_mode(1)]
 ```
 
 ### 4. Inference

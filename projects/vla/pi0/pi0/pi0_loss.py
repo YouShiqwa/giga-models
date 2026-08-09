@@ -6,8 +6,20 @@ import torch.nn.functional as F
 class PI0Loss(nn.Module):
     """Diffusion-style training loss for PI0 actions."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        dual_action_expert: bool = False,
+        manipulation_action_indices: tuple[int, ...] = (0, 1, 2, 3, 4, 5, 6),
+        mobility_action_indices: tuple[int, ...] = (7, 8, 9, 10, 11),
+        manipulation_loss_weight: float = 0.5,
+        mobility_loss_weight: float = 0.5,
+    ) -> None:
         super().__init__()
+        self.dual_action_expert = dual_action_expert
+        self.manipulation_loss_weight = manipulation_loss_weight
+        self.mobility_loss_weight = mobility_loss_weight
+        self.register_buffer('manipulation_action_indices', torch.tensor(manipulation_action_indices, dtype=torch.long), persistent=False)
+        self.register_buffer('mobility_action_indices', torch.tensor(mobility_action_indices, dtype=torch.long), persistent=False)
 
     def sample_noise(self, shape: tuple[int, ...], device: torch.device | str) -> torch.Tensor:
         """Sample standard normal noise with the given shape on the device."""
@@ -47,6 +59,12 @@ class PI0Loss(nn.Module):
             A tuple (x_t, time) where x_t has shape (B, T, D) and time has shape (B,).
         """
         noise = self.sample_noise(actions.shape, actions.device)
+        if self.dual_action_expert:
+            valid_action_mask = torch.zeros(actions.shape[-1], dtype=actions.dtype, device=actions.device)
+            valid_action_indices = torch.cat([self.manipulation_action_indices, self.mobility_action_indices]).to(actions.device)
+            valid_action_mask[valid_action_indices] = 1
+            actions = actions * valid_action_mask
+            noise = noise * valid_action_mask
         time = self.sample_time(actions.shape[0], actions.device)
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
@@ -58,7 +76,18 @@ class PI0Loss(nn.Module):
 
         return x_t, time
 
-    def forward(self, model_pred: torch.Tensor, loss_mask: torch.Tensor | None = None) -> torch.Tensor:
+    def _masked_channel_loss(
+        self,
+        squared_error: torch.Tensor,
+        channel_indices: torch.Tensor,
+        loss_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        loss = squared_error.index_select(-1, channel_indices).mean(dim=-1)
+        if loss_mask is not None:
+            loss = loss * loss_mask
+        return loss
+
+    def forward(self, model_pred: torch.Tensor, loss_mask: torch.Tensor | None = None) -> torch.Tensor | dict[str, torch.Tensor]:
         """Compute v-prediction MSE loss.
 
         Args:
@@ -66,11 +95,21 @@ class PI0Loss(nn.Module):
             loss_mask: Optional mask (B, T) to ignore padded steps.
 
         Returns:
-            Per-sample loss with shape (B, T) if mask provided then masked accordingly.
+            Single-tower per-step loss, or weighted manipulation/mobility losses
+            in dual-expert mode.
         Note:
             `add_noise` must be called before forward to set `self.u_t`.
         """
-        loss = F.mse_loss(self.u_t, model_pred, reduction='none').mean(dim=-1)
+        squared_error = F.mse_loss(self.u_t, model_pred, reduction='none')
+        if self.dual_action_expert:
+            manipulation_loss = self._masked_channel_loss(squared_error, self.manipulation_action_indices, loss_mask)
+            mobility_loss = self._masked_channel_loss(squared_error, self.mobility_action_indices, loss_mask)
+            return {
+                'manipulation_loss': self.manipulation_loss_weight * manipulation_loss,
+                'mobility_loss': self.mobility_loss_weight * mobility_loss,
+            }
+
+        loss = squared_error.mean(dim=-1)
         if loss_mask is not None:
             loss = loss * loss_mask
 

@@ -17,16 +17,30 @@ class Pi0Trainer(Trainer):
         Returns:
             A `PI0Policy` moved to the correct device and set to train mode.
         """
-        p0 = PI0Policy.from_pretrained(model_config.pretrained)
+        override_names = (
+            'dual_action_expert',
+            'manipulation_action_indices',
+            'mobility_action_indices',
+            'manipulation_loss_weight',
+            'mobility_loss_weight',
+        )
+        model_overrides = {name: model_config[name] for name in override_names if name in model_config}
+        p0 = PI0Policy.from_pretrained(model_config.pretrained, **model_overrides)
 
         p0.to(self.device)
         p0.train()
 
-        self.loss_func = PI0Loss()
+        self.loss_func = PI0Loss(
+            dual_action_expert=p0.dual_action_expert,
+            manipulation_action_indices=p0.manipulation_action_indices,
+            mobility_action_indices=p0.mobility_action_indices,
+            manipulation_loss_weight=p0.manipulation_loss_weight,
+            mobility_loss_weight=p0.mobility_loss_weight,
+        ).to(self.device)
 
         return p0
 
-    def forward_step(self, batch_dict: dict[str, torch.Tensor | list[torch.Tensor]]) -> torch.Tensor:
+    def forward_step(self, batch_dict: dict[str, torch.Tensor | list[torch.Tensor]]) -> torch.Tensor | dict[str, torch.Tensor]:
         """Perform one training step and return the loss tensor.
 
         Args:

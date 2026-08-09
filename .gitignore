@@ -112,6 +112,10 @@ venv.bak/
 # custom
 .DS_Store
 
+# Training outputs
+projects/vla/pi0/wandb/
+projects/vla/pi0/experiments/
+
 *.bin
 *.npy
 *.swp

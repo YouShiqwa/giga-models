@@ -1,3 +1,4 @@
+import copy
 import math
 
 import torch
@@ -112,8 +113,26 @@ class PI0Policy(ModelMixin, ConfigMixin):
         num_steps: int = 10,
         use_cache: bool = True,
         pi05_enabled: bool = False,
+        dual_action_expert: bool = False,
+        manipulation_action_indices: tuple[int, ...] = (0, 1, 2, 3, 4, 5, 6),
+        mobility_action_indices: tuple[int, ...] = (7, 8, 9, 10, 11),
+        manipulation_loss_weight: float = 0.5,
+        mobility_loss_weight: float = 0.5,
     ):
         super().__init__()
+
+        manipulation_action_indices = tuple(manipulation_action_indices)
+        mobility_action_indices = tuple(mobility_action_indices)
+        if dual_action_expert and not pi05_enabled:
+            raise ValueError('dual_action_expert is only supported for Pi0.5.')
+        if dual_action_expert:
+            self._validate_action_branches(
+                max_action_dim,
+                manipulation_action_indices,
+                mobility_action_indices,
+                manipulation_loss_weight,
+                mobility_loss_weight,
+            )
 
         # Store the parameters
         self.max_state_dim = max_state_dim
@@ -123,9 +142,15 @@ class PI0Policy(ModelMixin, ConfigMixin):
         self.num_steps = num_steps
         self.use_cache = use_cache
         self.pi05_enabled = pi05_enabled
+        self.dual_action_expert = dual_action_expert
+        self.manipulation_action_indices = manipulation_action_indices
+        self.mobility_action_indices = mobility_action_indices
+        self.manipulation_loss_weight = manipulation_loss_weight
+        self.mobility_loss_weight = mobility_loss_weight
 
         self.paligemma_with_expert = PaliGemmaWithExpertModel(
             pi05_enabled=pi05_enabled,
+            dual_action_expert=dual_action_expert,
         )
 
         # Projections are float32
@@ -139,6 +164,147 @@ class PI0Policy(ModelMixin, ConfigMixin):
 
         self.action_in_proj = nn.Linear(self.max_action_dim, self.proj_width, dtype=torch.float32)
         self.action_out_proj = nn.Linear(self.proj_width, self.max_action_dim, dtype=torch.float32)
+        if self.dual_action_expert:
+            self.mobility_action_in_proj = copy.deepcopy(self.action_in_proj)
+            self.mobility_action_out_proj = copy.deepcopy(self.action_out_proj)
+
+        manipulation_mask = torch.zeros(self.max_action_dim, dtype=torch.float32)
+        mobility_mask = torch.zeros(self.max_action_dim, dtype=torch.float32)
+        if self.dual_action_expert:
+            manipulation_mask[list(self.manipulation_action_indices)] = 1.0
+            mobility_mask[list(self.mobility_action_indices)] = 1.0
+        else:
+            manipulation_mask.fill_(1.0)
+        self.register_buffer('manipulation_action_mask', manipulation_mask, persistent=False)
+        self.register_buffer('mobility_action_mask', mobility_mask, persistent=False)
+
+    @staticmethod
+    def _validate_action_branches(
+        max_action_dim: int,
+        manipulation_action_indices: tuple[int, ...],
+        mobility_action_indices: tuple[int, ...],
+        manipulation_loss_weight: float,
+        mobility_loss_weight: float,
+    ) -> None:
+        if not manipulation_action_indices or not mobility_action_indices:
+            raise ValueError('Both action branches must contain at least one channel.')
+        manipulation_set = set(manipulation_action_indices)
+        mobility_set = set(mobility_action_indices)
+        if len(manipulation_set) != len(manipulation_action_indices) or len(mobility_set) != len(mobility_action_indices):
+            raise ValueError('Action branch indices must not contain duplicates.')
+        overlap = manipulation_set & mobility_set
+        if overlap:
+            raise ValueError(f'Action branch indices must be disjoint, but overlap at {sorted(overlap)}.')
+        invalid = sorted(index for index in manipulation_set | mobility_set if index < 0 or index >= max_action_dim)
+        if invalid:
+            raise ValueError(f'Action branch indices must be in [0, {max_action_dim}), but got {invalid}.')
+        if manipulation_loss_weight < 0 or mobility_loss_weight < 0:
+            raise ValueError('Action branch loss weights must be non-negative.')
+        if manipulation_loss_weight + mobility_loss_weight <= 0:
+            raise ValueError('At least one action branch loss weight must be positive.')
+
+    def _mobility_parameter_names(self) -> set[str]:
+        """Return parameters introduced exclusively by the mobility tower."""
+        if not self.dual_action_expert:
+            return set()
+
+        names = {
+            *(f'mobility_action_in_proj.{name}' for name, _ in self.mobility_action_in_proj.named_parameters()),
+            *(f'mobility_action_out_proj.{name}' for name, _ in self.mobility_action_out_proj.named_parameters()),
+            *(f'paligemma_with_expert.norms.2.{name}' for name, _ in self.paligemma_with_expert.norms[2].named_parameters()),
+        }
+        for layer_idx, layer in enumerate(self.paligemma_with_expert.layers):
+            modules = {
+                'self_attn.q_proj': layer.self_attn.q_proj[2],
+                'self_attn.k_proj': layer.self_attn.k_proj[2],
+                'self_attn.v_proj': layer.self_attn.v_proj[2],
+                'self_attn.o_proj': layer.self_attn.o_proj[2],
+                'mlps': layer.mlps[2],
+                'input_layernorms': layer.input_layernorms[2],
+                'post_attention_layernorms': layer.post_attention_layernorms[2],
+            }
+            for module_path, module in modules.items():
+                names.update(
+                    f'paligemma_with_expert.layers.{layer_idx}.{module_path}.2.{name}' for name, _ in module.named_parameters()
+                )
+        return names
+
+    def initialize_mobility_expert_from_manipulation(self) -> None:
+        """Clone the complete pretrained action expert into the mobility tower."""
+        if not self.dual_action_expert:
+            raise RuntimeError('Mobility initialization requires dual_action_expert=True.')
+        self.paligemma_with_expert.initialize_mobility_expert_from_manipulation()
+        self.mobility_action_in_proj = copy.deepcopy(self.action_in_proj)
+        self.mobility_action_out_proj = copy.deepcopy(self.action_out_proj)
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+        """Load old and dual-tower checkpoints with automatic expert cloning.
+
+        When an old single-action-expert checkpoint is loaded with
+        ``dual_action_expert=True``, all missing mobility parameters are copied
+        from the loaded action expert. Native dual-tower checkpoints load both
+        branches without reinitialization.
+        """
+        output_loading_info = kwargs.pop('output_loading_info', False)
+        model, loading_info = super().from_pretrained(
+            pretrained_model_name_or_path,
+            output_loading_info=True,
+            **kwargs,
+        )
+        if model.dual_action_expert:
+            mobility_parameter_names = model._mobility_parameter_names()
+            missing_keys = set(loading_info['missing_keys'])
+            missing_mobility = mobility_parameter_names & missing_keys
+            if missing_mobility:
+                if missing_mobility != mobility_parameter_names:
+                    missing_preview = sorted(missing_mobility)[:8]
+                    raise RuntimeError(
+                        'The checkpoint contains only part of the mobility expert. '
+                        f'Refusing an ambiguous initialization; missing examples: {missing_preview}'
+                    )
+                model.initialize_mobility_expert_from_manipulation()
+                loading_info['missing_keys'] = [key for key in loading_info['missing_keys'] if key not in mobility_parameter_names]
+
+        if output_loading_info:
+            return model, loading_info
+        return model
+
+    def _make_suffix_position_ids(
+        self,
+        prefix_pad_masks: torch.Tensor,
+        suffix_streams: list[torch.Tensor],
+    ) -> torch.Tensor:
+        """Create action positions, aligning both experts at each horizon step."""
+        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+        position_ids = []
+        for stream in suffix_streams:
+            stream_positions = torch.arange(stream.shape[1], device=stream.device, dtype=prefix_offsets.dtype)[None, :]
+            position_ids.append(prefix_offsets + stream_positions)
+        return torch.cat(position_ids, dim=1)
+
+    def _make_full_position_ids(
+        self,
+        prefix_pad_masks: torch.Tensor,
+        suffix_streams: list[torch.Tensor],
+    ) -> torch.Tensor:
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        suffix_position_ids = self._make_suffix_position_ids(prefix_pad_masks, suffix_streams)
+        return torch.cat([prefix_position_ids, suffix_position_ids], dim=1)
+
+    def _project_action_outputs(self, action_outputs: list[torch.Tensor]) -> torch.Tensor:
+        manipulation_output = action_outputs[0][:, -self.n_action_steps :]
+        manipulation_output = manipulation_output.to(dtype=self.action_out_proj.weight.dtype)
+        manipulation_prediction = self.action_out_proj(manipulation_output)
+        if not self.dual_action_expert:
+            return manipulation_prediction
+
+        mobility_output = action_outputs[1][:, -self.n_action_steps :]
+        mobility_output = mobility_output.to(dtype=self.mobility_action_out_proj.weight.dtype)
+        mobility_prediction = self.mobility_action_out_proj(mobility_output)
+        manipulation_mask = self.manipulation_action_mask.to(dtype=manipulation_prediction.dtype)
+        mobility_mask = self.mobility_action_mask.to(dtype=mobility_prediction.dtype)
+        return manipulation_prediction * manipulation_mask + mobility_prediction * mobility_mask
 
     def forward(
         self,
@@ -165,28 +331,24 @@ class PI0Policy(ModelMixin, ConfigMixin):
             Predicted v_t with shape (B, n_action_steps, action_dim).
         """
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, timestep)
+        suffix_streams, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, timestep)
 
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
 
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
-        position_ids = torch.cumsum(pad_masks, dim=1) - 1
+        position_ids = self._make_full_position_ids(prefix_pad_masks, suffix_streams)
 
-        (_, suffix_out), _ = self.paligemma_with_expert.forward(
+        outputs, _ = self.paligemma_with_expert.forward(
             attention_mask=att_2d_masks,
             position_ids=position_ids,
             past_key_values=None,
-            inputs_embeds=[prefix_embs, suffix_embs],
+            inputs_embeds=[prefix_embs, *suffix_streams],
             use_cache=False,
             fill_kv_cache=False,
-            adarms_cond=[None, adarms_cond],
+            adarms_cond=[None, *adarms_cond],
         )
-        suffix_out = suffix_out[:, -self.n_action_steps :]
-        # Original openpi code, upcast attention output
-        suffix_out = suffix_out.to(dtype=self.action_out_proj.weight.dtype)
-        v_t = self.action_out_proj(suffix_out)
-        return v_t
+        return self._project_action_outputs(outputs[1:])
 
     def sample_noise(self, shape: tuple[int, ...], device: torch.device | str) -> torch.Tensor:
         """Generate Gaussian noise for the action trajectory.
@@ -279,8 +441,8 @@ class PI0Policy(ModelMixin, ConfigMixin):
 
     def embed_suffix(
         self, state: torch.Tensor, noisy_actions: torch.Tensor, timestep: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        """Embed state, action and time tokens as the transformer suffix.
+    ) -> tuple[list[torch.Tensor], torch.Tensor, torch.Tensor, list[torch.Tensor | None]]:
+        """Embed state, action and time tokens into one or two expert streams.
 
         Args:
             state: (B, state_dim) robot state; ignored when pi05 is enabled.
@@ -288,31 +450,22 @@ class PI0Policy(ModelMixin, ConfigMixin):
             timestep: (B,) diffusion time in [0, 1].
 
         Returns:
-            (embs, pad_masks, att_masks, adarms_cond) where:
-              - embs: (B, Ns, D) suffix embeddings
-              - pad_masks: (B, Ns) valid mask
-              - att_masks: (B, Ns) causal scheme for suffix
-              - adarms_cond: (B, D) AdaRMS conditioning or None
+            ``(streams, pad_masks, att_masks, conditions)``. In dual mode the
+            streams are manipulation and mobility, each with ``T`` tokens; all
+            ``2T`` action tokens form one mutually visible attention block.
         """
-        embs = []
-        pad_masks = []
-        att_masks = []
+        if noisy_actions.shape[-1] != self.max_action_dim:
+            raise ValueError(
+                f'Expected noisy actions with {self.max_action_dim} channels, but got shape {tuple(noisy_actions.shape)}.'
+            )
 
-        action_emb = self.action_in_proj(noisy_actions)
-        bsize = action_emb.shape[0]
-        dtype = action_emb.dtype
-        device = action_emb.device
-
-        # Embed state
-        if not self.pi05_enabled:
-            state_emb = self.state_proj(state)
-            embs.append(state_emb[:, None, :])
-
-            state_mask = torch.ones(bsize, 1, dtype=torch.bool, device=device)
-            pad_masks.append(state_mask)
-
-            # Set attention masks so that image and language inputs do not attend to state or actions
-            att_masks += [1]
+        manipulation_input = noisy_actions
+        if self.dual_action_expert:
+            manipulation_input = manipulation_input * self.manipulation_action_mask.to(dtype=noisy_actions.dtype)
+        manipulation_emb = self.action_in_proj(manipulation_input)
+        bsize = manipulation_emb.shape[0]
+        dtype = manipulation_emb.dtype
+        device = manipulation_emb.device
 
         # Embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
         time_emb = create_sinusoidal_pos_embedding(timestep, self.proj_width, min_period=4e-3, max_period=4.0, device=device)
@@ -324,35 +477,38 @@ class PI0Policy(ModelMixin, ConfigMixin):
             time_emb = F.silu(time_emb)
             time_emb = self.time_mlp_out(time_emb)
             time_emb = F.silu(time_emb)
-            action_expert_emb = action_emb
             adarms_cond = time_emb
         else:
             # Fuse timestep + action information using an MLP
-            time_emb = time_emb[:, None, :].expand_as(action_emb)
-            action_time_emb = torch.cat([action_emb, time_emb], dim=2)
+            time_emb = time_emb[:, None, :].expand_as(manipulation_emb)
+            action_time_emb = torch.cat([manipulation_emb, time_emb], dim=2)
 
             action_time_emb = self.action_time_mlp_in(action_time_emb)
             action_time_emb = F.silu(action_time_emb)  # swish == silu
             action_time_emb = self.action_time_mlp_out(action_time_emb)
-            action_expert_emb = action_time_emb
+            manipulation_emb = action_time_emb
             adarms_cond = None
 
-        # Add to input tokens
-        embs.append(action_expert_emb)
+        if not self.pi05_enabled:
+            state_emb = self.state_proj(state)
+            manipulation_emb = torch.cat([state_emb[:, None, :], manipulation_emb], dim=1)
 
-        bsize, action_time_dim = action_expert_emb.shape[:2]
-        action_time_mask = torch.ones(bsize, action_time_dim, dtype=torch.bool, device=device)
-        pad_masks.append(action_time_mask)
+        streams = [manipulation_emb]
+        conditions: list[torch.Tensor | None] = [adarms_cond]
+        if self.dual_action_expert:
+            mobility_input = noisy_actions * self.mobility_action_mask.to(dtype=noisy_actions.dtype)
+            streams.append(self.mobility_action_in_proj(mobility_input))
+            conditions.append(adarms_cond)
 
-        # Set attention masks so that image, language and state inputs do not attend to action tokens
-        att_masks += [1] + ([0] * (self.n_action_steps - 1))
-
-        embs = torch.cat(embs, dim=1)
-        pad_masks = torch.cat(pad_masks, dim=1)
-        att_masks = torch.tensor(att_masks, dtype=embs.dtype, device=embs.device)
-        att_masks = att_masks[None, :].expand(bsize, len(att_masks))
-
-        return embs, pad_masks, att_masks, adarms_cond
+        total_suffix_len = sum(stream.shape[1] for stream in streams)
+        pad_masks = torch.ones(bsize, total_suffix_len, dtype=torch.bool, device=device)
+        # One causal-block marker makes both noisy action branches mutually visible.
+        att_masks = torch.zeros(bsize, total_suffix_len, dtype=torch.bool, device=device)
+        att_masks[:, 0] = True
+        if not self.pi05_enabled:
+            # Preserve Pi0's separate state block followed by the action block.
+            att_masks[:, 1] = True
+        return streams, pad_masks, att_masks, conditions
 
     @torch.no_grad()
     def sample_actions(
@@ -393,13 +549,16 @@ class PI0Policy(ModelMixin, ConfigMixin):
             attention_mask=prefix_att_2d_masks,
             position_ids=prefix_position_ids,
             past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
+            inputs_embeds=[prefix_embs] + [None] * self.paligemma_with_expert.num_action_experts,
             use_cache=self.use_cache,
             fill_kv_cache=True,
-            adarms_cond=[None, None],
+            adarms_cond=[None] * (1 + self.paligemma_with_expert.num_action_experts),
         )
 
         x_t = noise
+        if self.dual_action_expert:
+            valid_action_mask = self.manipulation_action_mask + self.mobility_action_mask
+            x_t = x_t * valid_action_mask.to(dtype=x_t.dtype)
         dt = -1.0 / self.num_steps
         timesteps = torch.arange(1.0, -dt / 2, dt, dtype=torch.float32, device=device)
         for timestep in timesteps:
@@ -434,7 +593,7 @@ class PI0Policy(ModelMixin, ConfigMixin):
         Returns:
             v_t prediction with shape (B, n_action_steps, action_dim).
         """
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, timestep)
+        suffix_streams, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, timestep)
 
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]
@@ -445,20 +604,15 @@ class PI0Policy(ModelMixin, ConfigMixin):
 
         full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
 
-        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
-        position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+        position_ids = self._make_suffix_position_ids(prefix_pad_masks, suffix_streams)
 
         outputs_embeds, _ = self.paligemma_with_expert.forward(
             attention_mask=full_att_2d_masks,
             position_ids=position_ids,
             past_key_values=past_key_values,
-            inputs_embeds=[None, suffix_embs],
+            inputs_embeds=[None, *suffix_streams],
             use_cache=self.use_cache,
             fill_kv_cache=False,
-            adarms_cond=[None, adarms_cond],
+            adarms_cond=[None, *adarms_cond],
         )
-        suffix_out = outputs_embeds[1]
-        suffix_out = suffix_out[:, -self.n_action_steps :]
-        suffix_out = suffix_out.to(dtype=self.action_out_proj.weight.dtype)
-        v_t = self.action_out_proj(suffix_out)
-        return v_t
+        return self._project_action_outputs(outputs_embeds[1:])
